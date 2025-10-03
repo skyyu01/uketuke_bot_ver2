@@ -47,42 +47,37 @@ function generateAnswers() {
       sheet.getRange(currentRow, SUMMARY_COL).setValue(analysisResult.summary);
       console.log(currentRow + '行目に分析結果を書き込みました。');
 
-      // 修正:
       var finalResult = researchAgent(question);
-      // 回答セルには 600字だけ（レコードには3部構成でもOKなら出し分け）
-      var finalAnswer = finalResult.final_600;
+      
+      var replyText = finalResult.reply_text || '（回答生成エラー）';
+      var publicText = finalResult.public_text || '（公開文生成エラー）';
 
-      // Google Chat 送信用も過剰な装飾を除去
-      var chatMessage = String(finalAnswer || '').replace(/---/g, '');
+      var chatMessage = String(replyText || '').replace(/---/g, '');
 
-
-      sheet.getRange(currentRow, GEMINI_ANSWER_COL).setValue(finalAnswer);
+      // GEMINI_ANSWER_COL（回答案）にはレビュー対象の「返信文」を保存
+      sheet.getRange(currentRow, GEMINI_ANSWER_COL).setValue(replyText);
+      // PUBLIC_ANSWER_COL（公開回答文）に「公開文」を保存
+      sheet.getRange(currentRow, PUBLIC_ANSWER_COL).setValue(publicText);
+      
       sheet.getRange(currentRow, GEMINI_STATUS_COL).setValue(STATUS_ANSWER_GENERATED);
 
       try {
         const logPayload = {
-          // 元の項目（後方互換）
           row: currentRow,
           question: question,
           analysis: analysisResult,
           queries: finalResult ? finalResult.search_query : [],
           sources: finalResult ? finalResult.web_research_result : [],
-          draftAnswer: finalAnswer,
+          draftAnswer: replyText, // Log the reply text
+          public_text: publicText, // Log the public text
           createdAt: new Date().toISOString(),
-
-          // ▼ ここからデバッグに効く追加入力 ▼
-          // RAG内部
           used_internal_chunks: finalResult ? finalResult.used_internal_chunks : [],
           reranked_internal_top3: finalResult ? finalResult.reranked_internal_top3 : [],
-          internal_refs: finalResult ? finalResult.internal_refs : [],  // 例: ["スライド 7","シート: 案件一覧"]
-          citations: finalResult ? finalResult.web_refs : [],           // 外部URL 1–2件
-
-          // 生成された要約と最終体裁（後から再現しやすい）
+          internal_refs: finalResult ? finalResult.internal_refs : [],
+          citations: finalResult ? finalResult.web_refs : [],
           final_internal_300: finalResult ? finalResult.final_internal_300 : '',
           final_web_300: finalResult ? finalResult.final_web_300 : '',
-          final_600: finalResult ? finalResult.final_600 : finalAnswer,
-
-          // 任意（調査ループのメタ）
+          final_600: finalResult ? finalResult.final_600 : replyText,
           research_loop_count: finalResult ? finalResult.research_loop_count : undefined
         };
 
@@ -97,7 +92,7 @@ function generateAnswers() {
 
       if (route === 'auto') {
         const dm = getDmFromRow_(currentRow);
-        finalizeAndNotify_(currentRow, finalAnswer, dm.space, dm.thread);
+        finalizeAndNotify_(currentRow, replyText, dm.space, dm.thread);
         sheet.getRange(currentRow, GEMINI_STATUS_COL).setValue('自動送付済');
         console.log("自動回答を行いました");
       } else {
@@ -331,7 +326,6 @@ function researchAgent(initialQuestion) {
     }
 
     if (allGuideText && allGuideText.trim()) {
-      // 1) キーワード生成
       var keywords = [];
       try {
         keywords = generateSearchKeywords_(initialQuestion) || [];
@@ -341,7 +335,6 @@ function researchAgent(initialQuestion) {
       }
       console.log('抽出された検索キーワード: ' + (keywords.join(', ') || '(なし)'));
 
-      // 2) チャンク化（スライド/シート単位のチャンクを想定）
       var chunks = [];
       try {
         chunks = chunkText_(allGuideText) || [];
@@ -350,15 +343,12 @@ function researchAgent(initialQuestion) {
         chunks = [];
       }
 
-      // 3) BM25風の予選（Top20程度まで拡張して返すよう findRelevantChunks_ を利用）
       try {
-        var prelimCandidates = findRelevantChunks_(chunks, keywords, 3 /* topK引数は内部でTop20へ拡張を推奨 */) || [];
-        // 後方互換（古い findRelevantChunks_ が「文字列配列」を返す場合に対応）
+        var prelimCandidates = findRelevantChunks_(chunks, keywords, 3) || [];
         prelim = prelimCandidates.map(function (c) {
           if (typeof c === 'string') {
             return { idx: -1, chunk: c, score: 1.0 };
           } else {
-            // {idx, chunk, score} を想定
             return {
               idx: (typeof c.idx === 'number' ? c.idx : -1),
               chunk: c.chunk || c.text || '',
@@ -366,14 +356,12 @@ function researchAgent(initialQuestion) {
             };
           }
         });
-        // ログ・デバッグ用に保持
         state.used_internal_chunks = prelim.slice(0, 20);
       } catch (e) {
         console.warn('BM25風予選（findRelevantChunks_）でエラー:', e);
         prelim = [];
       }
 
-      // 4) LLM再ランク（Top20 → Top3）
       var top3 = [];
       console.log("20個の候補",prelim)
       try {
@@ -385,30 +373,22 @@ function researchAgent(initialQuestion) {
       }
       state.reranked_internal_top3 = top3.slice();
 
-      // 5) Top3から社内300字要約を作成（出典を末尾に併記）
       if (top3.length) {
-        // ① 社内300字要約（既存）
         internalSummary = summarizeToLength_(
           top3.join('\n\n'),
           300,
           '社内資料の記述のみ。数字・条件は原文通り'
         );
 
-        // ② ▼ ここから“出典の最低限の表示”を追加 ▼
-        //   各チャンク先頭のヘッダから「スライド番号 or シート名」を抽出
-        //   （chunkText_ が '--- スライド n ---' / '--- シート: name ---' を付けている前提）
         var internalRefs = top3.map(function (c) {
           var m = c.match(/^--- (スライド [\d]+|シート: [^\n]+) ---/m);
           return m ? m[1] : null;
         }).filter(Boolean);
 
-        // 末尾に 1〜2件だけ併記
         if (internalRefs.length) {
           internalSummary += '\n(参考: ' + internalRefs.slice(0, 2).join(', ') + ')';
         }
-        // 呼び出し元でも使えるよう state に保存（返却用）
         state.internal_refs = internalRefs.slice(0, 2);
-        // ② ▲ ここまで追加 ▲
 
         console.log('社内ガイド Top3 → 300字要約を作成');
       } else {
@@ -426,7 +406,6 @@ function researchAgent(initialQuestion) {
   var seenDomains = [];
   function domainOf(u) { try { return (new URL(u)).hostname.replace(/^www\./, ''); } catch (e) { return ''; } }
 
-  // 初期クエリ生成
   try {
     var initialQueries = (generateQuery(state, config) || [])
       .filter(function (q) { return q && seenQueries.indexOf(q) === -1; })
@@ -440,7 +419,6 @@ function researchAgent(initialQuestion) {
     console.warn('検索クエリ生成で失敗（generateQuery）:', e);
   }
 
-  // ループ調査
   for (var loop = 0; loop < config.max_research_loops; loop++) {
     state.research_loop_count = loop + 1;
     if (seenQueries.length >= config.max_total_queries) break;
@@ -454,7 +432,6 @@ function researchAgent(initialQuestion) {
       try {
         var researchResult = webResearch(query);
 
-        // 後方互換: webResearch が文字列を返す場合に対応
         if (typeof researchResult === 'string') {
           searchResults.push(researchResult);
           state.web_research_result.push(researchResult);
@@ -470,7 +447,6 @@ function researchAgent(initialQuestion) {
             state.web_citations.push(c);
           });
         } else {
-          // 形式不明
           var fallback = String(researchResult || '（検索結果なし）');
           searchResults.push(fallback);
           state.web_research_result.push(fallback);
@@ -489,12 +465,10 @@ function researchAgent(initialQuestion) {
       reflectionResult = { is_sufficient: true, knowledge_gap: "", follow_up_queries: [] };
     }
 
-    // 追加クエリ生成
     var nextQs = ((reflectionResult && reflectionResult.follow_up_queries) || [])
       .filter(function (q) { return q && seenQueries.indexOf(q) === -1; })
       .slice(0, 3);
 
-    // 同一ドメインに偏らないよう、簡易ペナルティを文字列レベルで付与
     var penalize = seenDomains.slice(0, 2).map(function (d) { return '-site:' + d; }).join(' ');
     var diversified = nextQs.map(function (q) { return penalize ? (q + ' ' + penalize) : q; });
 
@@ -522,20 +496,16 @@ function researchAgent(initialQuestion) {
     }
   }
 
-  // ========= Web300字 要約（参考URLを1件だけ付与） =========
   var webSummary = '';
   try {
     var webTextJoined = '';
     if (state.web_research_result && state.web_research_result.length) {
-      // 文字列配列を想定。オブジェクト対応は上で text を push 済み。
       webTextJoined = state.web_research_result.join('\n\n');
     }
-    // 代表URLを1件だけ選ぶ（先頭の citation を優先）
     var refUrl = '';
     if (state.web_citations && state.web_citations.length) {
       refUrl = state.web_citations[0].url || '';
     } else {
-      // citationsが空の時は、テキスト内からURLらしきものを拾う簡易フォールバック
       var m = webTextJoined.match(/https?:\/\/[^\s\)\]]+/);
       refUrl = m ? m[0] : '';
     }
@@ -550,7 +520,6 @@ function researchAgent(initialQuestion) {
     webSummary = '';
   }
 
-  // ========= 参考：過去案件（ragSearch_v3/v2 があれば添付） =========
   try {
     var ragHits = (typeof ragSearch_v3 === 'function')
       ? ragSearch_v3(state.messages[0].content, Number(PropertiesService.getScriptProperties().getProperty('RAG_TOP_K') || 5))
@@ -565,31 +534,36 @@ function researchAgent(initialQuestion) {
     console.warn('RAG付与に失敗しました（処理は継続）:', e);
   }
 
-  // ========= 最終600字の合成 =========
-  console.log("最終回答を生成中...");
-  var final600 = '';
+  // ========= 最終回答の合成（返信文・公開文） =========
+  console.log("最終回答（返信文・公開文）を生成中...");
+  let finalAnswers = {
+    reply_text: '・回答の生成に失敗しました。',
+    public_text: '・回答の生成に失敗しました。'
+  };
   try {
-    final600 = finalizeAnswerWithSections_(state.messages[0].content, internalSummary, webSummary);
+    finalAnswers = finalizeAnswerWithSections_(state.messages[0].content, internalSummary, webSummary);
   } catch (e) {
     console.warn('最終合成でエラー。空回答にフォールバック:', e);
-    final600 = '・現時点の社内/外部素材からは根拠が不足しています。\n・質問の前提(対象ツール/期間/部署など)を補足してください。';
+    finalAnswers = {
+      reply_text: '・現時点の社内/外部素材からは根拠が不足しています。\n・質問の前提(対象ツール/期間/部署など)を補足してください。',
+      public_text: '・現時点の社内/外部素材からは根拠が不足しています。'
+    };
   }
 
-  // ========= メッセージ配列にも残す（互換） =========
   state.messages.push({
     role: "model",
     content:
       (internalSummary ? '【社内300字】\n' + internalSummary + '\n\n' : '') +
       (webSummary ? '【外部300字】\n' + webSummary + '\n\n' : '') +
-      '【最終回答(600字以内)】\n' + final600
+      '【最終回答(返信文)】\n' + finalAnswers.reply_text
   });
 
-  // ========= 呼び出し元で直接使えるフィールド =========
   state.final_internal_300 = internalSummary;
   state.final_web_300 = webSummary;
-  state.final_600 = final600;
+  state.final_600 = finalAnswers.reply_text; // 後方互換性のために維持
+  state.reply_text = finalAnswers.reply_text;
+  state.public_text = finalAnswers.public_text;
 
-  // 代表出典も返すと便利（オプション）
   state.internal_refs = internalRefs.slice(0, 2);
   state.web_refs = (state.web_citations.slice(0, 2).map(function (c) { return c.url; }));
 
@@ -683,28 +657,52 @@ function reflection(state) {
 
 
 function finalizeAnswerWithSections_(question, internalSummary, webSummary) {
-  var sys =
-    'あなたは優秀なアシスタントです。\n' +
-    '以下の二つの素材（社内要約300字/外部要約300字）だけを根拠に、' +
-    '重複を統合して日本語で最終回答を600字以内で作成してください。\n' +
-    '・見出しは付けず、箇条書き主体\n' +
-    '・社内情報を優先、その後に外部情報\n' +
-    '・根拠URLはあれば1〜2個だけ末尾に(参考: …)で併記\n' +
-    '・推測は禁止、素材に無い情報を足さない';
+  const sys =
+    'あなたは優秀なアシスタントです。以下の素材を基に、2種類の回答を作成してください。\n' +
+    '1.  **返信文**: 質問者個人に返信するための丁寧な文章。挨拶を含み、600字以内で作成します。\n' +
+    '2.  **公開回答文**: 個人情報や挨拶などを除き、要点だけをFAQのようにまとめた普遍的な文章。300字以内で作成します。\n\n' +
+    '# 指示\n' +
+    '- 見出しは付けず、箇条書きを主体とします。\n' +
+    '- 社内情報を優先し、その後に外部情報を記述します。\n' +
+    '- 根拠URLがあれば、それぞれの文末に(参考: ...)として1〜2個だけ併記します。\n' +
+    '- 推測は禁止し、素材に無い情報は足さないでください。\n' +
+    '- 必ず指定されたJSON形式で出力してください。';
 
-  var user =
+  const user =
     '# 質問\n' + question + '\n\n' +
-    '# 社内300字\n' + (internalSummary || '') + '\n\n' +
-    '# 外部300字\n' + (webSummary || '');
+    '# 社内300字\n' + (internalSummary || '（情報なし）') + '\n\n' +
+    '# 外部300字\n' + (webSummary || '（情報なし）');
 
-  var payload = {
+  const payload = {
     system_instruction: { parts: [{ text: sys }] },
     contents: [{ parts: [{ text: user }] }],
-    generationConfig: { temperature: 0.0 }
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0.0,
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          reply_text: { "type": "STRING" },
+          public_text: { "type": "STRING" }
+        },
+        required: ["reply_text", "public_text"]
+      }
+    }
   };
-  var resp = callGeminiApi(GEMINI_API_URL, payload);
-  var out = (resp.candidates && resp.candidates[0] && resp.candidates[0].content.parts[0].text) || '';
-  return smartTrim_(out, 600);
+
+  try {
+    const resp = callGeminiApi(GEMINI_API_URL, payload);
+    const resultText = resp.candidates[0].content.parts[0].text;
+    return JSON.parse(resultText);
+  } catch (e) {
+    console.error('finalizeAnswerWithSections_でエラー:', e);
+    // フォールバックとして、従来の形式で回答を生成
+    const fallbackAnswer = '・現時点の社内/外部素材からは根拠が不足しています。\n・質問の前提(対象ツール/期間/部署など)を補足してください。';
+    return {
+      reply_text: fallbackAnswer,
+      public_text: fallbackAnswer
+    };
+  }
 }
 
 

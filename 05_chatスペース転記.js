@@ -742,11 +742,20 @@ function getSaAccessToken_() {
   return token;
 }
 
-function sendChatAsBot_(spaceName, text, threadName) {
+function sendChatAsBot_(spaceName, text, threadName, cardPayload) {
   if (!/^spaces\//.test(spaceName)) throw new Error('invalid spaceName: ' + spaceName);
   var url = 'https://chat.googleapis.com/v1/' + spaceName + '/messages';
-  var body = { text: text };
-  if (threadName) body.thread = { name: threadName };
+  
+  var body;
+  if (cardPayload) {
+    body = cardPayload;
+  } else {
+    body = { text: text };
+  }
+
+  if (threadName) {
+    body.thread = { name: threadName };
+  }
 
   var token = getSaAccessToken_();
   var res = UrlFetchApp.fetch(url, {
@@ -757,7 +766,11 @@ function sendChatAsBot_(spaceName, text, threadName) {
     muteHttpExceptions: true
   });
   var sc = res.getResponseCode();
-  if (sc < 200 || sc >= 300) throw new Error('Chat REST failed: ' + sc + ' ' + res.getContentText());
+  if (sc < 200 || sc >= 300) {
+    console.error('sendChatAsBot_ failed with code ' + sc, res.getContentText());
+    throw new Error('Chat REST failed: ' + sc + ' ' + res.getContentText());
+  }
+  return JSON.parse(res.getContentText());
 }
 
 // 公開用ラッパー（クライアントから呼ぶのはこちら）
@@ -780,5 +793,54 @@ function __catalog() {
       .sort();
   } catch (e) {
     return 'ERR:' + (e && e.message);
+  }
+}
+
+/**
+ * 「いいえ」が押されたときに、質問者とサポートメンバーのDMスペースを作成する
+ * @param {string} questionerId - 質問者のユーザーID (例: 'users/12345')
+ * @param {string} questionerName - 質問者の表示名
+ * @param {number} row - スプレッドシートの行番号
+ */
+function createEscalationSpace(questionerId, questionerName, row) {
+  // ★要設定: スクリプトプロパティにカンマ区切りでユーザーIDを保存 (例: users/123,users/456)
+  const SUPPORT_MEMBER_USER_IDS = (PropertiesService.getScriptProperties().getProperty('SUPPORT_MEMBER_USER_IDS') || '')
+    .split(',')
+    .map(id => id.trim())
+    .filter(Boolean);
+
+  if (SUPPORT_MEMBER_USER_IDS.length === 0) {
+    console.error('エスカレーション先のサポートメンバーが設定されていません (Script Property: SUPPORT_MEMBER_USER_IDS)');
+    return;
+  }
+
+  try {
+    // Create a space with the questioner and support members
+    const members = [questionerId, ...SUPPORT_MEMBER_USER_IDS].map(id => ({ member: { name: id } }));
+    
+    // Using the Chat advanced service
+    const space = Chat.Spaces.create({ members: members });
+
+    // Post an initial message to the new space
+    const initialMessage = `【要対応・詳細ヒアリング】\n行番号: ${row}\n質問者: ${questionerName} さん\n\nこの回答では問題が解決しなかったため、詳細なヒアリングをお願いします。`;
+    sendChatAsBot_(space.name, initialMessage);
+
+    return space.name;
+  } catch (e) {
+    console.error('エスカレーションスペースの作成に失敗しました。', e);
+    
+    // Fallback notification to a general support channel
+    // ★要設定: スクリプトプロパティにフォールバック先のスペース名を保存 (例: spaces/ABCDEFG)
+    const fallbackSpace = PropertiesService.getScriptProperties().getProperty('FALLBACK_SUPPORT_SPACE_NAME');
+    if (fallbackSpace) {
+      const fallbackMessage = `【要手動対応】\n行番号: ${row} の質問者 ${questionerName} さんとのスペース作成に失敗しました。手動でスペースを作成し、ヒアリングをお願いします。`;
+      try {
+        sendChatAsBot_(fallbackSpace, fallbackMessage);
+      } catch (e2) {
+        console.error('フォールバック通知の送信にも失敗しました。', e2);
+      }
+    }
+    // Re-throw the original error to be caught by the calling function
+    throw e;
   }
 }

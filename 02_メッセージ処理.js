@@ -36,19 +36,20 @@ const INQUIRY_TYPE_COL = 4; // 問い合わせ内容分類列
 const QUESTION_COL = 6; // 質問本文
 const SUMMARY_COL = 7;  // 質問要約列
 const FILE_LINK_COL = 8; // 添付ファイルリンク列
-const FINAL_ANSWER_COL = 9;   // ← 要確認：実シートの「最終回答」列の列番号
-const DONE_CHECK_COL   = 11;   // ← 要確認：実シートの「対応完了（チェックボックス）」列
-const FAQ_CHECK_COL    = 12;   // ← 要確認：実シートの「FAQ公開（チェックボックス）」列
-const GEMINI_STATUS_COL = 13; // geminiでの回答作成状況
-const GEMINI_ANSWER_COL = 14; // geminiでの回答案
-const LOG_LINK_COL     = 17; // 回答ログURL（空いている列を使用）
-const DM_WEBHOOK_URL_COL = 18; // 対象ユーザーとのDM URL,使っていない列を使用
+const FINAL_ANSWER_COL = 9;   // 返信文
+const PUBLIC_ANSWER_COL = 10; // 公開回答文
+const DONE_CHECK_COL   = 12;   // 対応完了（チェックボックス）
+const FAQ_CHECK_COL    = 13;   // FAQ公開（チェックボックス）
+const GEMINI_STATUS_COL = 14; // geminiでの回答作成状況
+const GEMINI_ANSWER_COL = 15; // geminiでの回答案
+const LOG_LINK_COL     = 18; // 回答ログURL（空いている列を使用）
+const DM_WEBHOOK_URL_COL = 19; // 対象ユーザーとのDM URL,使っていない列を使用
 // DM（1:1）の space 名（例: "spaces/AAAA..."）を保存する列
-const DM_SPACE_NAME_COL   = 19;   // 未使用列に合わせて調整OK
+const DM_SPACE_NAME_COL   = 20;   // 未使用列に合わせて調整OK
 // （任意）返信スレッドを保持したい場合
-const CHAT_THREAD_NAME_COL = 20;  // 不要なら定義しなくてOK
-const CHAT_MESSAGE_NAME_COL = 21; // メッセージIDを格納する列（Z列）
-const USER_ID_COL = 22; // ユーザーID（例: users/12345）を保存する列
+const CHAT_THREAD_NAME_COL = 21;  // 不要なら定義しなくてOK
+const CHAT_MESSAGE_NAME_COL = 22; // メッセージIDを格納する列
+const USER_ID_COL = 23; // ユーザーID（例: users/12345）を保存する列
 
 
 
@@ -497,6 +498,88 @@ function fetchSpaceAndThreadByMessageName_(messageName) {
   } catch (e) {
     console.warn('fetchSpaceAndThreadByMessageName_ failed:', e);
     return { spaceName: '', threadName: '' };
+  }
+}
+
+
+function handleFeedbackAction(e) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(3000)) {
+    return {
+      actionResponse: {
+        type: 'UPDATE_MESSAGE',
+        message: { text: '⚠️ この操作は現在処理中です。しばらくしてからもう一度お試しください。' }
+      }
+    };
+  }
+
+  try {
+    const params = e.common.parameters;
+    const row = Number(params.row);
+    const isResolved = params.isResolved === 'true';
+
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+
+    const doneValue = sheet.getRange(row, DONE_CHECK_COL).isChecked();
+    if (doneValue) {
+      return {
+        actionResponse: {
+          type: 'UPDATE_MESSAGE',
+          message: { text: 'フィードバックありがとうございます。この件は既に対応完了となっています。' }
+        }
+      };
+    }
+
+    if (isResolved) {
+      // --- "Yes" Flow ---
+      sheet.getRange(row, DONE_CHECK_COL).setValue(true);
+
+      const completionSpace = PropertiesService.getScriptProperties().getProperty('COMPLETION_NOTICE_SPACE_NAME');
+      if (completionSpace) {
+        const questionerName = sheet.getRange(row, USER_NAME_COL).getValue();
+        const message = `✅ 対応完了: 行番号 ${row} (${questionerName} さん) の問題が解決されました。`;
+        try {
+          sendChatAsBot_(completionSpace, message);
+        } catch (err) {
+          console.error(`Failed to send completion notice to ${completionSpace}`, err);
+        }
+      }
+
+      return {
+        actionResponse: {
+          type: 'UPDATE_MESSAGE',
+          message: { text: 'フィードバックありがとうございます！問題が解決して何よりです。' }
+        }
+      };
+
+    } else {
+      // --- "No" Flow ---
+      const questionerId = sheet.getRange(row, USER_ID_COL).getValue();
+      const questionerName = sheet.getRange(row, USER_NAME_COL).getValue();
+
+      if (!questionerId) {
+        throw new Error(`ユーザーIDが行 ${row} に見つかりません。`);
+      }
+
+      createEscalationSpace(questionerId, questionerName, row);
+
+      return {
+        actionResponse: {
+          type: 'UPDATE_MESSAGE',
+          message: { text: 'フィードバックありがとうございます。担当者が確認できるよう、別途対応スペースを作成しました。そちらで詳細をお伺いします。' }
+        }
+      };
+    }
+  } catch (err) {
+    console.error('handleFeedbackAction failed:', err);
+    return {
+      actionResponse: {
+        type: 'UPDATE_MESSAGE',
+        message: { text: `⚠️ エラーが発生しました: ${err.message}` }
+      }
+    };
+  } finally {
+    lock.releaseLock();
   }
 }
 
