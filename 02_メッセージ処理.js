@@ -48,6 +48,7 @@ const DM_SPACE_NAME_COL   = 19;   // 未使用列に合わせて調整OK
 // （任意）返信スレッドを保持したい場合
 const CHAT_THREAD_NAME_COL = 20;  // 不要なら定義しなくてOK
 const CHAT_MESSAGE_NAME_COL = 21; // メッセージIDを格納する列（Z列）
+const USER_ID_COL = 22; // ユーザーID（例: users/12345）を保存する列
 
 
 
@@ -158,7 +159,7 @@ function onMessage(e) {
               card: {
                 header: {
                   title: '内容の確認',
-                  subtitle: '以下の内容で送信します。よろしければ「はい」をクリックしてください！ \n※追加の質問・相談も「はい」をクリックしてください！'
+                  subtitle: '以下の内容で送信します。よろしければ「はい」をクリックしてください！ \n※追加の質問・相請も「はい」をクリックしてください！'
                 },
                 sections: [{
                   widgets: [
@@ -178,6 +179,7 @@ function onMessage(e) {
                                   { key: 'isConfirmed', value: 'true' },
                                   { key: 'questionText', value: questionText },
                                   { key: 'user', value: userName },
+                                  { key: 'userId', value: user.name },
                                   { key: 'attachment', value: JSON.stringify(attachmentData) },
                                   { key: 'senderEmail', value: senderEmail }
                                 ]
@@ -245,6 +247,7 @@ function handleConfirmationAction(e) {
     const questionText = p.questionText || '';
     const userName = p.user || (e?.sender?.displayName || 'ユーザー');
     const attachmentParam = p.attachment || null;
+    const userId = p.userId || '';
 
     // 送信者メール（必須）
     let senderEmail = (p.senderEmail || '').trim().toLowerCase();
@@ -302,28 +305,15 @@ function handleConfirmationAction(e) {
     const msgName = messageName;
     const meta = fetchSpaceAndThreadByMessageName_(msgName); // { spaceName, threadName }
 
-    const rowData = [
-      Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'), //1
-      senderDisplay, //2
-      '', //3
-      '', //4
-      '', //5
-      questionText, //6
-      '', //7
-      fileUrl, //7
-      '', //8
-      '', //9
-      '', //10
-      '', //11
-      STATUS_NEW_QUESTION, //12
-      '', //13
-      '', //14
-      '', //15
-      '', //16
-      '', //17
-      meta.spaceName, //18
-      meta.threadName //19
-    ];
+    const rowData = new Array(22).fill('');
+    rowData[TIMESTAMP_COL - 1] = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+    rowData[USER_NAME_COL - 1] = senderDisplay;
+    rowData[QUESTION_COL - 1] = questionText;
+    rowData[FILE_LINK_COL - 1] = fileUrl;
+    rowData[GEMINI_STATUS_COL - 1] = STATUS_NEW_QUESTION;
+    rowData[DM_SPACE_NAME_COL - 1] = meta.spaceName;
+    rowData[CHAT_THREAD_NAME_COL - 1] = meta.threadName;
+    rowData[USER_ID_COL - 1] = userId;
 
     appendRowToSheetWithSA_(rowData, SHEET_NAME, 'USER_ENTERED');
 

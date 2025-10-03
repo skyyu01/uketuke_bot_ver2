@@ -405,32 +405,75 @@ function finalizeAndNotify_(row, finalAnswer, dmSpaceName, dmThreadName) {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheet = ss.getSheetByName(SHEET_NAME);
 
-  // ---- 最終反映（シート：ここは絶対）----
+  // --- 最終反映（シート）---
   if (FINAL_ANSWER_COL) sheet.getRange(row, FINAL_ANSWER_COL).setValue(finalAnswer);
-  if (DONE_CHECK_COL)   sheet.getRange(row, DONE_CHECK_COL).setValue(true);
-  if (FAQ_CHECK_COL)    sheet.getRange(row, FAQ_CHECK_COL).setValue(true);
+  if (FAQ_CHECK_COL) sheet.getRange(row, FAQ_CHECK_COL).setValue(true); // FAQ公開はチェック
   if (GEMINI_STATUS_COL) sheet.getRange(row, GEMINI_STATUS_COL).setValue('承認・送付済');
+  // ※ 「対応完了」チェックはユーザーの「はい」フィードバックを待つため、ここではセットしない
 
-  // ---- DM宛先の決定（引数 > 行）----
+  // --- DM宛先の決定 ---
   const space = String(dmSpaceName || '').trim()
     || (DM_SPACE_NAME_COL ? String(sheet.getRange(row, DM_SPACE_NAME_COL).getValue() || '').trim() : '');
   const thread = String(dmThreadName || '').trim()
     || (CHAT_THREAD_NAME_COL ? String(sheet.getRange(row, CHAT_THREAD_NAME_COL).getValue() || '').trim() : '');
 
-  // ---- DM本文（長文保護）----
-  const MAX_LEN = 3800; // 安全マージン（Chatの制約対策）
-  const body = '【回答のご連絡】\n\n' + String(finalAnswer || '');
-  const text = body.length > MAX_LEN ? (body.slice(0, MAX_LEN - 1) + '…') : body;
-
-  // ---- DM送信（任意 / ベストエフォート）----
   if (!/^spaces\//.test(space)) {
     console.warn('DM skipped: space not set for row', row);
     return 'DM宛先未設定のため通知スキップ';
   }
+
+  // --- フィードバックカードの作成 ---
+  const cardBody = '【回答のご連絡】\n\n' + String(finalAnswer || '');
+  const cardPayload = {
+    cardsV2: [{
+      cardId: 'feedback-card-' + row,
+      card: {
+        header: { title: '回答のご連絡' },
+        sections: [
+          { widgets: [{ textParagraph: { text: cardBody } }] },
+          {
+            header: 'この回答で問題は解決しましたか？',
+            widgets: [{
+              buttonList: {
+                buttons: [
+                  {
+                    text: 'はい',
+                    onClick: {
+                      action: {
+                        function: 'handleFeedbackAction',
+                        parameters: [
+                          { key: 'isResolved', value: 'true' },
+                          { key: 'row', value: String(row) }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    text: 'いいえ',
+                    onClick: {
+                      action: {
+                        function: 'handleFeedbackAction',
+                        parameters: [
+                          { key: 'isResolved', value: 'false' },
+                          { key: 'row', value: String(row) }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }]
+          }
+        ]
+      }
+    }]
+  };
+
+  // --- DM送信 ---
   try {
-    sendChatAsBot_(space, text, thread);
-    console.log('DM sent:', space, thread);
-    return ''; // 注記なし
+    sendChatAsBot_(space, null, thread, cardPayload); // テキストをnullにし、カードペイロードを渡す
+    console.log('Feedback card sent to:', space, thread || '(no thread)');
+    return ''; // 成功
   } catch (e) {
     console.error('DM failed but sheet committed:', e);
     return 'DM送付に失敗（ログ参照）';
