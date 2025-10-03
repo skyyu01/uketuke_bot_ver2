@@ -158,7 +158,7 @@ function onMessage(e) {
               card: {
                 header: {
                   title: '内容の確認',
-                  subtitle: '以下の内容で送信します。よろしければ「はい」をクリックしてください！'
+                  subtitle: '以下の内容で送信します。よろしければ「はい」をクリックしてください！ \n※追加の質問・相談も「はい」をクリックしてください！'
                 },
                 sections: [{
                   widgets: [

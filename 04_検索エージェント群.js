@@ -60,15 +60,33 @@ function generateAnswers() {
       sheet.getRange(currentRow, GEMINI_STATUS_COL).setValue(STATUS_ANSWER_GENERATED);
 
       try {
-        var logUrl = saveAnswerLogJson_(currentRow, {
+        const logPayload = {
+          // 元の項目（後方互換）
           row: currentRow,
           question: question,
           analysis: analysisResult,
           queries: finalResult ? finalResult.search_query : [],
           sources: finalResult ? finalResult.web_research_result : [],
           draftAnswer: finalAnswer,
-          createdAt: new Date().toISOString()
-        });
+          createdAt: new Date().toISOString(),
+
+          // ▼ ここからデバッグに効く追加入力 ▼
+          // RAG内部
+          used_internal_chunks: finalResult ? finalResult.used_internal_chunks : [],
+          reranked_internal_top3: finalResult ? finalResult.reranked_internal_top3 : [],
+          internal_refs: finalResult ? finalResult.internal_refs : [],  // 例: ["スライド 7","シート: 案件一覧"]
+          citations: finalResult ? finalResult.web_refs : [],           // 外部URL 1–2件
+
+          // 生成された要約と最終体裁（後から再現しやすい）
+          final_internal_300: finalResult ? finalResult.final_internal_300 : '',
+          final_web_300: finalResult ? finalResult.final_web_300 : '',
+          final_600: finalResult ? finalResult.final_600 : finalAnswer,
+
+          // 任意（調査ループのメタ）
+          research_loop_count: finalResult ? finalResult.research_loop_count : undefined
+        };
+
+        const logUrl = saveAnswerLogJson_(currentRow, logPayload);
         if (LOG_LINK_COL) sheet.getRange(currentRow, LOG_LINK_COL).setValue(logUrl);
       } catch (e) {
         console.warn('回答ログ保存に失敗: row=' + currentRow, e);
@@ -76,9 +94,6 @@ function generateAnswers() {
 
       var spreadsheetUrl = SpreadsheetApp.openById(SPREADSHEET_ID).getUrl();
       var dmSpaceName = values[i][DM_SPACE_NAME_COL - 1];
-
-      // Google Chat用にメッセージを整形（区切り線などを削除）
-      var chatMessage = finalAnswer.replace(/---/g, '');
 
       if (route === 'auto') {
         const dm = getDmFromRow_(currentRow);
@@ -132,8 +147,20 @@ function generateSearchKeywords_(question) {
  */
 function chunkText_(text) {
   if (!text) return [];
-  var chunks = text.split(/\n---\sスライド\s\d+\s---\n|\n\n+/);
-  return chunks.filter(function(c) { return c.trim() !== ''; });
+  // (^|\n) を追加して先頭の見出しも拾う
+  var splitter = /(?:^|\n)--- (?:スライド \d+|シート: [^\n]+) ---\n/;
+  var parts = text.split(splitter);
+  // 見出し自体も抽出（先頭も拾う）
+  var headers = text.match(/(?:^|\n)--- (?:スライド \d+|シート: [^\n]+) ---\n/g) || [];
+
+  var chunks = [];
+  // parts[0] は splitter の前置（多くは空）。以降を headers とペアにする
+  for (var i = 1; i < parts.length; i++) {
+    var header = headers[i - 1].replace(/^\n/, '').trim(); // 先頭改行を除去
+    var body = parts[i].trim();
+    if (body) chunks.push(header + '\n' + body);
+  }
+  return chunks;
 }
 
 /**
@@ -141,86 +168,91 @@ function chunkText_(text) {
  */
 function findRelevantChunks_(chunks, keywords, topK) {
   topK = topK || 3;
-  if (!keywords || keywords.length === 0) {
-    return chunks.slice(0, topK);
-  }
-  var scoredChunks = chunks.map(function(chunk) {
-    var score = 0;
-    keywords.forEach(function(keyword) {
-      if (chunk.toLowerCase().indexOf(keyword.toLowerCase()) !== -1) {
-        score++;
-      }
-    });
-    return { chunk: chunk, score: score };
-  });
-  var relevantChunks = scoredChunks.filter(function(item) {
-    return item.score > 0;
-  });
-  relevantChunks.sort(function(a, b) {
-    return b.score - a.score;
-  });
-  return relevantChunks.slice(0, topK).map(function(item) {
-    return item.chunk;
-  });
+  if (!chunks.length) return [];
+  var qToks = tokenize_(((keywords||[]).join(' ')));
+  var idf = computeIdf_(chunks);
+  var lengths = chunks.map(function(c){ return tokenize_(c).length; });
+  var avgLen = lengths.reduce(function(a,b){return a+b;},0)/lengths.length;
+
+  var scored = chunks.map(function(c, idx){
+    return { idx: idx, chunk: c, score: bm25Score_(c, qToks, idf, 1.5, 0.75, avgLen) };
+  }).filter(function(o){ return o.score>0; });
+
+  scored.sort(function(a,b){ return b.score - a.score; });
+  // まずTop20までに拡げて後段のLLM再ランクへ
+  return scored.slice(0, Math.max(topK, 20));
 }
+
 
 // --- Googleドキュメントからテキストを抽出するヘルパー関数群 ---
 
 function getTextFromGoogleSlide_(slideUrl) {
   try {
-    var presentationIdMatch = slideUrl.match(/presentation\/d\/([a-zA-Z0-9-_]+)/);
-    if (!presentationIdMatch || !presentationIdMatch[1]) {
-      console.log('無効なGoogle Slide URLです: ' + slideUrl);
-      return '';
-    }
-    var presentationId = presentationIdMatch[1];
-    var presentation = SlidesApp.openById(presentationId);
-    var slides = presentation.getSlides();
-    var allText = '';
-    for (var i = 0; i < slides.length; i++) {
-      var slide = slides[i];
-      allText += '\n--- スライド ' + (i + 1) + ' ---\n';
-      var shapes = slide.getShapes();
-      for (var j = 0; j < shapes.length; j++) {
-        var shape = shapes[j];
-        if (shape.getText) {
-          var textRange = shape.getText();
-          if (textRange) {
-            allText += textRange.asString();
-          }
-        }
-      }
-    }
-    return allText;
-  } catch (e) {
-    console.error('Google Slideからのテキスト抽出に失敗しました: ' + slideUrl, e);
-    return '（スライド「' + slideUrl + '」の読み込みに失敗しました）';
+    var m = slideUrl.match(/presentation\/d\/([a-zA-Z0-9-_]+)/);
+    if (!m) return '';
+    var p = SlidesApp.openById(m[1]);
+    var out = [];
+    p.getSlides().forEach(function(slide, idx){
+      var title = '';
+      var body  = [];
+      slide.getShapes().forEach(function(sh){
+        if (!sh.getText) return;
+        var t = sh.getText().asString().trim();
+        if (!t) return;
+        if (!title && (sh.getShapeType && sh.getShapeType() === SlidesApp.ShapeType.TITLE)) title = t;
+        else body.push(t);
+      });
+      var chunk = [
+        '--- スライド ' + (idx+1) + ' ---',
+        '【タイトル】' + (title || '(無題)'),
+        body.join('\n')
+      ].join('\n');
+      out.push(chunk);
+    });
+    return out.join('\n\n');
+  } catch(e){ 
+    console.error('Slide抽出失敗:', slideUrl, e); 
+    return '（スライド取得失敗）';
   }
 }
 
 function getTextFromGoogleSheet_(sheetUrl) {
   try {
-    var spreadsheetIdMatch = sheetUrl.match(/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-    if (!spreadsheetIdMatch || !spreadsheetIdMatch[1]) {
-      console.log('無効なGoogle Sheet URLです: ' + sheetUrl);
-      return '';
-    }
-    var spreadsheetId = spreadsheetIdMatch[1];
-    var spreadsheet = SpreadsheetApp.openById(spreadsheetId);
-    var allText = '';
-    var sheets = spreadsheet.getSheets();
-    for (var i = 0; i < sheets.length; i++) {
-      var sheet = sheets[i];
-      allText += '\n--- シート: ' + sheet.getName() + ' ---\n';
-      var data = sheet.getDataRange().getValues();
-      for (var j = 0; j < data.length; j++) {
-        allText += data[j].join('\t') + '\n';
+    var m = sheetUrl.match(/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!m) return '';
+    var ss = SpreadsheetApp.openById(m[1]);
+
+    // ★ スプレッドシート（ファイル）の名前で分岐
+    var isSpecialFile = (typeof ss.getName === 'function') && (ss.getName() === '案件別要件整理シート');
+
+    // 走査対象シートを決定
+    var targetSheets;
+    if (isSpecialFile) {
+      var only = ss.getSheetByName('対応案件表');
+      if (!only) {
+        // 期待するシートが無い場合はわかるように返す（運用に応じて空文字にしてもOK）
+        return '（対象スプレッドシートは「案件別要件整理シート」ですが、シート「対応案件表」が見つかりません）';
       }
+      targetSheets = [only];
+    } else {
+      targetSheets = ss.getSheets(); // 従来動作：全シート
     }
-    return allText;
-  } catch (e) {
-    console.error('Google Sheetからのテキスト抽出に失敗しました: ' + sheetUrl, e);
-    return '（シート「' + sheetUrl + '」の読み込みに失敗しました）';
+
+    var out = [];
+    targetSheets.forEach(function(sh){
+      var values = sh.getDataRange().getValues();
+      if (!values.length) return;
+      var header = values[0].join(' | ');
+      var rows = values.slice(1).map(function(r,i){
+        return (i+2)+': '+ r.join(' | ');
+      }).join('\n');
+      out.push('--- シート: ' + sh.getName() + ' ---\n【ヘッダ】' + header + '\n' + rows);
+    });
+
+    return out.join('\n\n');
+  } catch(e){
+    console.error('Sheet抽出失敗:', sheetUrl, e);
+    return '（シート取得失敗）';
   }
 }
 
@@ -243,112 +275,246 @@ function getTextFromGoogleDoc_(docUrl) {
 /**
  * 質問に基づき、Web検索と複数回の思考を経て回答を生成するエージェント
  */
+/**
+ * 質問に基づき、社内資料（Slides/Sheets/Docs）と外部Webの要点を集約し、
+ * 300字×2（社内/外部）→最終600字回答を合成して返す。
+ * - 社内資料は BM25風の予選（Top20相当）→ LLM再ランク（Top3）で精度を上げる
+ * - Webは複数クエリ・リフレクションで必要十分性を判断
+ * - 出典（内部: スライド番号/シート名、外部: URL）を 1–2件だけ末尾に併記
+ * - 返却値 state にデバッグ用フィールド（used_internal_chunks など）を含める
+ */
 function researchAgent(initialQuestion) {
+  // ========= 基本設定 =========
   var config = {
-    initial_search_query_count: 3,
-    max_research_loops: 2,
+    initial_search_query_count: 3, // 生成する初期クエリ数
+    max_research_loops: 2,         // Webリサーチの最大ループ
+    max_total_queries: 10          // Web検索の総クエリ上限
   };
-  var INTERNAL_GUIDE_URLS = (PropertiesService.getScriptProperties().getProperty('INTERNAL_GUIDE_URLS') || '')
-    .split(',').map(function(s){return s.trim()}).filter(Boolean);
-  var internalGuideSection = '';
 
-  // --- ▼ RAG実装 ここから ▼ ---
-  var internalSummary = '';  // ← 300字サマリをここに入れる
-
-  if (INTERNAL_GUIDE_URLS.length > 0) {
-    var allGuideText = '';
-    var slideUrls = INTERNAL_GUIDE_URLS.filter(function(url){ return url.includes('docs.google.com/presentation/d/'); });
-    var sheetUrls = INTERNAL_GUIDE_URLS.filter(function(url){ return url.includes('docs.google.com/spreadsheets/d/'); });
-    var docUrls   = INTERNAL_GUIDE_URLS.filter(function(url){ return url.includes('docs.google.com/document/d/'); });
-
-    if (slideUrls.length) allGuideText += slideUrls.map(getTextFromGoogleSlide_).join('\n\n');
-    if (sheetUrls.length) allGuideText += (allGuideText ? '\n\n' : '') + sheetUrls.map(getTextFromGoogleSheet_).join('\n\n');
-    if (docUrls.length)   allGuideText += (allGuideText ? '\n\n' : '') + docUrls.map(getTextFromGoogleDoc_).join('\n\n');
-
-    if (allGuideText.trim()) {
-      var keywords = generateSearchKeywords_(initialQuestion);
-      console.log('抽出された検索キーワード: ' + keywords.join(', '));
-      var chunks = chunkText_(allGuideText);
-      var relevantChunks = findRelevantChunks_(chunks, keywords, 3); // 上位3チャンク
-
-      if (relevantChunks.length > 0) {
-        // 300字で要約（関連が薄い場合は短くなるだけ。スキップ判定は下流で実施）
-        internalSummary = summarizeToLength_(relevantChunks.join('\n\n'), 300, '社内資料に書かれていない推測は書かない');
-        console.log('社内ガイドから ' + relevantChunks.length + ' 件抽出 → 300字要約を作成');
-      } else {
-        console.log('社内ガイド内に質問と関連する情報は見つかりませんでした。');
-      }
-    }
-  }
-  // --- ▲ RAG実装 ここまで ▲ ---
-
-  config.max_total_queries = 10;
-  var seenQueries = [];
-  var seenDomains = [];
-  function domainOf(u){ try{ return (new URL(u)).hostname.replace(/^www\./,''); }catch(e){ return ''; } }
-
+  // ========= ステート =========
   var state = {
     messages: [{ role: "user", content: initialQuestion }],
     search_query: [],
-    web_research_result: [],
+    web_research_result: [],   // 後方互換: 文字列 or オブジェクトの text を格納
+    web_citations: [],         // {url, title?} の配列
     sources_gathered: [],
     research_loop_count: 0,
     number_of_ran_queries: 0,
+    used_internal_chunks: [],  // 予選に使った内部チャンク（スコア付き）
+    reranked_internal_top3: [] // 最終的に採用したTop3チャンク
   };
 
-  var initialQueries = generateQuery(state, config)
-    .filter(function(q) { return q && seenQueries.indexOf(q) === -1; })
-    .slice(0, config.initial_search_query_count);
-  for(var k=0; k<initialQueries.length; k++) seenQueries.push(initialQueries[k]);
-  state.search_query = state.search_query.concat(initialQueries);
-  state.number_of_ran_queries += initialQueries.length;
-  console.log('生成された検索クエリ: ' + initialQueries.join(', '));
+  // ========= 社内資料（RAG） =========
+  var INTERNAL_GUIDE_URLS = (PropertiesService.getScriptProperties().getProperty('INTERNAL_GUIDE_URLS') || '')
+    .split(',')
+    .map(function (s) { return s.trim(); })
+    .filter(Boolean);
 
+  var internalSummary = '';      // 社内300字
+  var internalRefs = [];         // “スライド7”や“シート:案件一覧”など
+  var prelim = [];               // BM25風の予選（Top20相当のスコア付き想定）
+
+  if (INTERNAL_GUIDE_URLS.length > 0) {
+    var allGuideText = '';
+    try {
+      var slideUrls = INTERNAL_GUIDE_URLS.filter(function (url) { return url.includes('docs.google.com/presentation/d/'); });
+      var sheetUrls = INTERNAL_GUIDE_URLS.filter(function (url) { return url.includes('docs.google.com/spreadsheets/d/'); });
+      console.log("csvファイルがあるか",sheetUrls)
+      var docUrls   = INTERNAL_GUIDE_URLS.filter(function (url) { return url.includes('docs.google.com/document/d/'); });
+
+      if (slideUrls.length) allGuideText += slideUrls.map(getTextFromGoogleSlide_).join('\n\n');
+      if (sheetUrls.length) allGuideText += (allGuideText ? '\n\n' : '') + sheetUrls.map(getTextFromGoogleSheet_).join('\n\n');
+      console.log("csvみたい", sheetUrls.map(getTextFromGoogleSheet_).join('\n\n'))
+      if (docUrls.length)   allGuideText += (allGuideText ? '\n\n' : '') + docUrls.map(getTextFromGoogleDoc_).join('\n\n');
+    } catch (e) {
+      console.warn('社内資料の取得中にエラー:', e);
+    }
+
+    if (allGuideText && allGuideText.trim()) {
+      // 1) キーワード生成
+      var keywords = [];
+      try {
+        keywords = generateSearchKeywords_(initialQuestion) || [];
+      } catch (e) {
+        console.warn('キーワード抽出失敗: フォールバックで無視', e);
+        keywords = [];
+      }
+      console.log('抽出された検索キーワード: ' + (keywords.join(', ') || '(なし)'));
+
+      // 2) チャンク化（スライド/シート単位のチャンクを想定）
+      var chunks = [];
+      try {
+        chunks = chunkText_(allGuideText) || [];
+      } catch (e) {
+        console.warn('チャンク化失敗: ', e);
+        chunks = [];
+      }
+
+      // 3) BM25風の予選（Top20程度まで拡張して返すよう findRelevantChunks_ を利用）
+      try {
+        var prelimCandidates = findRelevantChunks_(chunks, keywords, 3 /* topK引数は内部でTop20へ拡張を推奨 */) || [];
+        // 後方互換（古い findRelevantChunks_ が「文字列配列」を返す場合に対応）
+        prelim = prelimCandidates.map(function (c) {
+          if (typeof c === 'string') {
+            return { idx: -1, chunk: c, score: 1.0 };
+          } else {
+            // {idx, chunk, score} を想定
+            return {
+              idx: (typeof c.idx === 'number' ? c.idx : -1),
+              chunk: c.chunk || c.text || '',
+              score: (typeof c.score === 'number' ? c.score : 1.0)
+            };
+          }
+        });
+        // ログ・デバッグ用に保持
+        state.used_internal_chunks = prelim.slice(0, 20);
+      } catch (e) {
+        console.warn('BM25風予選（findRelevantChunks_）でエラー:', e);
+        prelim = [];
+      }
+
+      // 4) LLM再ランク（Top20 → Top3）
+      var top3 = [];
+      console.log("20個の候補",prelim)
+      try {
+        top3 = rerankWithLLM_(initialQuestion, prelim) || [];
+        console.log("最終候補",top3)
+      } catch (e) {
+        console.warn('再ランク失敗→予選上位を流用:', e);
+        top3 = prelim.slice(0, 3).map(function (o) { return o.chunk; });
+      }
+      state.reranked_internal_top3 = top3.slice();
+
+      // 5) Top3から社内300字要約を作成（出典を末尾に併記）
+      if (top3.length) {
+        // ① 社内300字要約（既存）
+        internalSummary = summarizeToLength_(
+          top3.join('\n\n'),
+          300,
+          '社内資料の記述のみ。数字・条件は原文通り'
+        );
+
+        // ② ▼ ここから“出典の最低限の表示”を追加 ▼
+        //   各チャンク先頭のヘッダから「スライド番号 or シート名」を抽出
+        //   （chunkText_ が '--- スライド n ---' / '--- シート: name ---' を付けている前提）
+        var internalRefs = top3.map(function (c) {
+          var m = c.match(/^--- (スライド [\d]+|シート: [^\n]+) ---/m);
+          return m ? m[1] : null;
+        }).filter(Boolean);
+
+        // 末尾に 1〜2件だけ併記
+        if (internalRefs.length) {
+          internalSummary += '\n(参考: ' + internalRefs.slice(0, 2).join(', ') + ')';
+        }
+        // 呼び出し元でも使えるよう state に保存（返却用）
+        state.internal_refs = internalRefs.slice(0, 2);
+        // ② ▲ ここまで追加 ▲
+
+        console.log('社内ガイド Top3 → 300字要約を作成');
+      } else {
+        console.log('社内ガイド内に関連チャンクは見つかりませんでした。');
+      }
+    } else {
+      console.log('社内ガイドの本文テキストが空でした。');
+    }
+  } else {
+    console.log('INTERNAL_GUIDE_URLS が未設定または空です。');
+  }
+
+  // ========= Webリサーチ =========
+  var seenQueries = [];
+  var seenDomains = [];
+  function domainOf(u) { try { return (new URL(u)).hostname.replace(/^www\./, ''); } catch (e) { return ''; } }
+
+  // 初期クエリ生成
+  try {
+    var initialQueries = (generateQuery(state, config) || [])
+      .filter(function (q) { return q && seenQueries.indexOf(q) === -1; })
+      .slice(0, config.initial_search_query_count);
+
+    for (var k = 0; k < initialQueries.length; k++) seenQueries.push(initialQueries[k]);
+    state.search_query = state.search_query.concat(initialQueries);
+    state.number_of_ran_queries += initialQueries.length;
+    console.log('生成された検索クエリ: ' + initialQueries.join(', '));
+  } catch (e) {
+    console.warn('検索クエリ生成で失敗（generateQuery）:', e);
+  }
+
+  // ループ調査
   for (var loop = 0; loop < config.max_research_loops; loop++) {
     state.research_loop_count = loop + 1;
-    var searchResults = [];
-    var currentQueries = state.search_query.slice(-state.number_of_ran_queries);
     if (seenQueries.length >= config.max_total_queries) break;
 
-    for(var l=0; l<currentQueries.length; l++){
+    var searchResults = [];
+    var currentQueries = state.search_query.slice(-state.number_of_ran_queries);
+
+    for (var l = 0; l < currentQueries.length; l++) {
       var query = currentQueries[l];
       console.log('ウェブ調査中 (' + (loop + 1) + '/' + config.max_research_loops + '): "' + query + '"');
-      var researchResult = webResearch(query);
-      if(researchResult.citations){
-        researchResult.citations.forEach(function(c) { 
-          var d = domainOf(c.url); 
-          if (d && seenDomains.indexOf(d) === -1) seenDomains.push(d); 
-        });
+      try {
+        var researchResult = webResearch(query);
+
+        // 後方互換: webResearch が文字列を返す場合に対応
+        if (typeof researchResult === 'string') {
+          searchResults.push(researchResult);
+          state.web_research_result.push(researchResult);
+        } else if (researchResult && typeof researchResult === 'object') {
+          var txt = researchResult.text || '';
+          var cits = Array.isArray(researchResult.citations) ? researchResult.citations : [];
+          searchResults.push(txt);
+          state.web_research_result.push(txt);
+          cits.forEach(function (c) {
+            if (!c || !c.url) return;
+            var d = domainOf(c.url);
+            if (d && seenDomains.indexOf(d) === -1) seenDomains.push(d);
+            state.web_citations.push(c);
+          });
+        } else {
+          // 形式不明
+          var fallback = String(researchResult || '（検索結果なし）');
+          searchResults.push(fallback);
+          state.web_research_result.push(fallback);
+        }
+      } catch (e) {
+        console.warn('webResearch 実行中にエラー:', e);
       }
-      searchResults.push(researchResult);
     }
-    state.web_research_result = state.web_research_result.concat(searchResults);
 
     console.log("調査結果を評価中...");
-    var reflectionResult = reflection(state);
+    var reflectionResult = null;
+    try {
+      reflectionResult = reflection(state);
+    } catch (e) {
+      console.warn('reflection の実行に失敗。十分と見なして打ち切り:', e);
+      reflectionResult = { is_sufficient: true, knowledge_gap: "", follow_up_queries: [] };
+    }
 
-    var nextQs = (reflectionResult.follow_up_queries || [])
-      .filter(function(q) { return q && seenQueries.indexOf(q) === -1; })
+    // 追加クエリ生成
+    var nextQs = ((reflectionResult && reflectionResult.follow_up_queries) || [])
+      .filter(function (q) { return q && seenQueries.indexOf(q) === -1; })
       .slice(0, 3);
 
-    var penalize = seenDomains.slice(0,2).map(function(d){ return '-site:' + d; }).join(' ');
-    var diversified = nextQs.map(function(q){ return penalize ? q + ' ' + penalize : q; });
+    // 同一ドメインに偏らないよう、簡易ペナルティを文字列レベルで付与
+    var penalize = seenDomains.slice(0, 2).map(function (d) { return '-site:' + d; }).join(' ');
+    var diversified = nextQs.map(function (q) { return penalize ? (q + ' ' + penalize) : q; });
 
-    for(var m=0; m<diversified.length; m++){
+    for (var m = 0; m < diversified.length; m++) {
       if (seenQueries.length < config.max_total_queries) {
         state.search_query.push(diversified[m]);
         seenQueries.push(diversified[m]);
       }
     }
 
-    if (reflectionResult.is_sufficient) {
+    if (reflectionResult && reflectionResult.is_sufficient) {
       console.log("情報が十分であると判断。最終回答を生成します。");
       break;
     } else {
-      console.log('知識ギャップを検出: ' + reflectionResult.knowledge_gap);
-      console.log('追加のクエリを生成: ' + reflectionResult.follow_up_queries.join(', '));
-      state.search_query = state.search_query.concat(reflectionResult.follow_up_queries);
-      state.number_of_ran_queries = reflectionResult.follow_up_queries.length;
+      var gap = reflectionResult ? reflectionResult.knowledge_gap : '(不明)';
+      var fuq = reflectionResult ? reflectionResult.follow_up_queries : [];
+      console.log('知識ギャップを検出: ' + gap);
+      console.log('追加のクエリを生成: ' + fuq.join(', '));
+      state.search_query = state.search_query.concat(fuq);
+      state.number_of_ran_queries = fuq.length;
     }
 
     if (loop === config.max_research_loops - 1) {
@@ -356,51 +522,81 @@ function researchAgent(initialQuestion) {
     }
   }
 
-  // --- Web要約(300字) ---
+  // ========= Web300字 要約（参考URLを1件だけ付与） =========
   var webSummary = '';
-  if (state.web_research_result && state.web_research_result.length) {
-    // 収集テキストを一本化して300字要約。必要ならURLが本文に含まれていれば1つだけ末尾に括弧で併記
+  try {
+    var webTextJoined = '';
+    if (state.web_research_result && state.web_research_result.length) {
+      // 文字列配列を想定。オブジェクト対応は上で text を push 済み。
+      webTextJoined = state.web_research_result.join('\n\n');
+    }
+    // 代表URLを1件だけ選ぶ（先頭の citation を優先）
+    var refUrl = '';
+    if (state.web_citations && state.web_citations.length) {
+      refUrl = state.web_citations[0].url || '';
+    } else {
+      // citationsが空の時は、テキスト内からURLらしきものを拾う簡易フォールバック
+      var m = webTextJoined.match(/https?:\/\/[^\s\)\]]+/);
+      refUrl = m ? m[0] : '';
+    }
+
     webSummary = summarizeToLength_(
-      state.web_research_result.join('\n\n'),
+      webTextJoined + (refUrl ? ('\n(参考:' + refUrl + ')') : ''),
       300,
-      '本文にURLが含まれる場合は1つだけ末尾に(参考:URL)の形式で併記'
+      '本文以外の一般論は書かない'
     );
+  } catch (e) {
+    console.warn('Web300字要約でエラー:', e);
+    webSummary = '';
   }
 
-
+  // ========= 参考：過去案件（ragSearch_v3/v2 があれば添付） =========
   try {
     var ragHits = (typeof ragSearch_v3 === 'function')
-      ? ragSearch_v3(state.messages[0].content, Number(PropertiesService.getScriptProperties().getProperty('RAG_TOP_K')||5))
+      ? ragSearch_v3(state.messages[0].content, Number(PropertiesService.getScriptProperties().getProperty('RAG_TOP_K') || 5))
       : ((typeof ragSearch_v2 === 'function')
-         ? ragSearch_v2(state.messages[0].content, Number(PropertiesService.getScriptProperties().getProperty('RAG_TOP_K')||5))
-         : []);
+        ? ragSearch_v2(state.messages[0].content, Number(PropertiesService.getScriptProperties().getProperty('RAG_TOP_K') || 5))
+        : []);
     if (Array.isArray(ragHits) && ragHits.length) {
-      var appendix = '\n\n---\n【類似事例（過去案件）】\n' + ragHits.map(function(r, i){ return (i+1)+'. ' + r.url; }).join('\n');
+      var appendix = '\n\n---\n【類似事例（過去案件）】\n' + ragHits.map(function (r, i) { return (i + 1) + '. ' + r.url; }).join('\n');
       state.messages.push({ role: "model", content: appendix });
     }
   } catch (e) {
     console.warn('RAG付与に失敗しました（処理は継続）:', e);
   }
 
+  // ========= 最終600字の合成 =========
   console.log("最終回答を生成中...");
+  var final600 = '';
+  try {
+    final600 = finalizeAnswerWithSections_(state.messages[0].content, internalSummary, webSummary);
+  } catch (e) {
+    console.warn('最終合成でエラー。空回答にフォールバック:', e);
+    final600 = '・現時点の社内/外部素材からは根拠が不足しています。\n・質問の前提(対象ツール/期間/部署など)を補足してください。';
+  }
 
-  // 旧 finalizeAnswer を使わず、新しい合成器で 600 字に収める
-  var final600 = finalizeAnswerWithSections_(state.messages[0].content, internalSummary, webSummary);
-
-  // メッセージ配列にも残す（互換のため）
-  state.messages.push({ role: "model", content:
-    (internalSummary ? '【社内300字】\n' + internalSummary + '\n\n' : '') +
-    (webSummary ? '【外部300字】\n' + webSummary + '\n\n' : '') +
-    '【最終回答(600字以内)】\n' + final600
+  // ========= メッセージ配列にも残す（互換） =========
+  state.messages.push({
+    role: "model",
+    content:
+      (internalSummary ? '【社内300字】\n' + internalSummary + '\n\n' : '') +
+      (webSummary ? '【外部300字】\n' + webSummary + '\n\n' : '') +
+      '【最終回答(600字以内)】\n' + final600
   });
 
-  // 呼び出し元で直接使えるよう返却フィールドも付ける
+  // ========= 呼び出し元で直接使えるフィールド =========
   state.final_internal_300 = internalSummary;
-  state.final_web_300      = webSummary;
-  state.final_600          = final600;
+  state.final_web_300 = webSummary;
+  state.final_600 = final600;
+
+  // 代表出典も返すと便利（オプション）
+  state.internal_refs = internalRefs.slice(0, 2);
+  state.web_refs = (state.web_citations.slice(0, 2).map(function (c) { return c.url; }));
 
   return state;
 }
+
+
 
 // --- リサーチエージェントのヘルパー関数群 ---
 
@@ -485,6 +681,7 @@ function reflection(state) {
   }
 }
 
+
 function finalizeAnswerWithSections_(question, internalSummary, webSummary) {
   var sys =
     'あなたは優秀なアシスタントです。\n' +
@@ -507,7 +704,7 @@ function finalizeAnswerWithSections_(question, internalSummary, webSummary) {
   };
   var resp = callGeminiApi(GEMINI_API_URL, payload);
   var out = (resp.candidates && resp.candidates[0] && resp.candidates[0].content.parts[0].text) || '';
-  return hardTrim_(out, 600);
+  return smartTrim_(out, 600);
 }
 
 
@@ -578,6 +775,62 @@ function analyzeQuestion(question) {
 
 
 // === 共通: 文字数制御ユーティリティ ===
+// 文末優先で「だいたい600字」に収める（途中で切らない）
+// ・targetChars 付近〜+flex の範囲で、最初に現れる文末（。．！？!? または改行）で切る
+// ・見つからなければ targetChars より手前の最後の文末で切る
+// ・それも無ければ最大長（targetChars + flex）で切る
+function smartTrim_(s, targetChars, opts) {
+  s = String(s || '').trim();
+  if (!s) return '';
+
+  // デフォルト設定：目標600字、上ぶれ最大+200字、手前側は-80字まではOK
+  var o = opts || {};
+  var flex = typeof o.flex === 'number' ? o.flex : 200;    // どこまで上ぶれ許容するか
+  var back = typeof o.back === 'number' ? o.back : 80;     // どこまで手前に戻ってよいか
+  var min = typeof o.min === 'number' ? o.min : 520;       // 極端に短くならないよう下限を目安化
+
+  if (s.length <= targetChars + flex) return s; // 目標+許容内ならそのまま返す
+
+  var startAfter = Math.max(0, targetChars - back);
+  var endBefore  = Math.min(s.length, targetChars + flex);
+
+  // 文末候補の区切り（句点・感嘆・疑問・改行）
+  var delimiter = /[。．！!？?\n]/g;
+
+  // ① 目標の少し手前から+flexの範囲内で「先に現れる」文末を探す（途中切断を避けたいので優先）
+  delimiter.lastIndex = startAfter;
+  var cutIdx = -1, m;
+  while ((m = delimiter.exec(s)) !== null) {
+    var idx = m.index;
+    if (idx >= startAfter && idx <= endBefore) { cutIdx = idx + 1; break; }
+    if (idx > endBefore) break;
+  }
+
+  // ② 見つからなければ、目標直前までで「最後に現れた」文末を探す
+  if (cutIdx === -1) {
+    var lastBefore = -1;
+    delimiter.lastIndex = 0;
+    while ((m = delimiter.exec(s)) !== null) {
+      if (m.index < targetChars) lastBefore = m.index + 1;
+      else break;
+    }
+    if (lastBefore !== -1 && lastBefore >= Math.min(min, targetChars - back)) cutIdx = lastBefore;
+  }
+
+  // ③ まだ無ければ、強制的に target+flex で切る（途中切断の可能性はあるが最小限）
+  if (cutIdx === -1) cutIdx = endBefore;
+
+  // 末尾の中途記号や空白を整理（…等の付与はしない：文を切らない方針）
+  var out = s.slice(0, cutIdx).replace(/\s+$/,'');
+  return out;
+}
+
+// 既存互換ラッパー：厳密カットはやめ、文末優先のソフト制限に委譲
+function hardTrim_(s, maxChars) {
+  return smartTrim_(s, maxChars || 600, { flex: 200, back: 80, min: 520 });
+}
+
+// 厳密に600文字できりたいときはこっちを使用
 function hardTrim_(s, maxChars) {
   s = String(s || '').trim();
   if (s.length <= maxChars) return s;
@@ -604,3 +857,92 @@ function summarizeToLength_(text, maxChars, extraInstruction) {
   // 念のためハードカット
   return hardTrim_(out.replace(/\n{3,}/g, '\n\n').trim(), maxChars);
 }
+
+function normalizeJa_(s) {
+  if (!s) return '';
+  // 全角→半角 / ひら→カタ / 記号・空白正規化 / 小文字化
+  s = s.normalize('NFKC')
+       .replace(/[‐-‒–—―ー]/g, '-')        // ダッシュ類統一
+       .replace(/\s+/g, ' ')
+       .trim()
+       .toLowerCase();
+  return s;
+}
+function tokenize_(s) {
+  // 粗い日本語用トークナイザ（記号で分割＋2-4gramを追加）
+  s = normalizeJa_(s).replace(/[^\p{L}\p{N}\s-]/gu, ' ');
+  var toks = s.split(/\s+/).filter(Boolean);
+  var grams = [];
+  for (var n=2; n<=4; n++){
+    for (var i=0; i+n<=toks.length; i++) grams.push(toks.slice(i,i+n).join(' '));
+  }
+  return toks.concat(grams);
+}
+
+
+var __idfCache = null;
+function computeIdf_(chunks) {
+  if (__idfCache) return __idfCache;
+  var df = {};
+  chunks.forEach(function(c){
+    var seen = {};
+    tokenize_(c).forEach(function(t){ seen[t]=1; });
+    Object.keys(seen).forEach(function(t){ df[t]=(df[t]||0)+1; });
+  });
+  var N = chunks.length;
+  var idf = {};
+  Object.keys(df).forEach(function(t){
+    idf[t] = Math.log( (N - df[t] + 0.5) / (df[t] + 0.5) + 1 );
+  });
+  __idfCache = idf;
+  return idf;
+}
+
+function bm25Score_(chunk, queryTokens, idf, k1, b, avgLen) {
+  k1 = k1 || 1.5; b = b || 0.75;
+  var toks = tokenize_((chunk));
+  var len = toks.length;
+  var tf = {};
+  toks.forEach(function(t){ tf[t]=(tf[t]||0)+1; });
+
+  var score = 0;
+  var seen = {};
+  queryTokens.forEach(function(qt){
+    if (seen[qt]) return; seen[qt]=1; // 同一語の重複カウント抑制
+    var f = tf[qt] || 0;
+    var id = idf[qt] || 0;
+    var denom = f + k1*(1 - b + b*len/avgLen);
+    score += id * (f * (k1+1)) / (denom || 1);
+  });
+  return score;
+}
+
+function rerankWithLLM_(question, scoredTop) {
+  if (!scoredTop || !scoredTop.length) return [];
+  var items = scoredTop.slice(0, 20).map(function(o, i){
+    return (i+1) + '. ' + o.chunk.slice(0, 800); // LLM入力安全化
+  }).join('\n\n');
+
+  var prompt = '質問への関連度で次の抜粋をスコア0〜1で評価し、上位3件を返す。' +
+    'JSON: {"ranking":[{"idx":番号,"score":数値}...]}。番号は与えた番号を用いる。\n\n' +
+    '質問:\n' + question + '\n\n候補:\n' + items;
+
+  var payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0.0 }
+  };
+  var resp = callGeminiApi(GEMINI_API_URL_FLASH, payload);
+  try {
+    var js = JSON.parse(resp.candidates[0].content.parts[0].text);
+    var topIdx = (js.ranking||[]).sort(function(a,b){ return b.score-a.score; }).slice(0,3).map(function(r){ return r.idx-1; });
+    return topIdx.map(function(i){ return scoredTop[i].chunk; });
+  } catch(e){
+    console.warn('再ランク失敗→BM25上位を流用');
+    return scoredTop.slice(0,3).map(function(o){ return o.chunk; });
+  }
+}
+
+
+
+
+
